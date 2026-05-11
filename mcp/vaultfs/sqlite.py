@@ -8,7 +8,8 @@ from pathlib import Path
 
 import aiosqlite
 
-from .base import VaultFS
+from services.chunker import chunk_text, store_chunks_sqlite
+from .base import VaultFS, DuplicateDocumentError
 
 logger = logging.getLogger(__name__)
 
@@ -132,20 +133,29 @@ class SqliteVaultFS(VaultFS):
         row = await cursor.fetchone()
         doc_number = row[0]
 
-        await db.execute(
-            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
-            "file_type, status, content, tags, date, metadata, version, document_number) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, 0, ?)",
-            (doc_id, self.user_id, filename, title, dir_path, relative_path, source_kind,
-             file_type, content, json.dumps(tags), date,
-             json.dumps(metadata) if metadata else None, doc_number),
-        )
-        await db.commit()
+        try:
+            await db.execute(
+                "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
+                "file_type, status, content, tags, date, metadata, version, document_number) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, 1, ?)",
+                (doc_id, self.user_id, filename, title, dir_path, relative_path, source_kind,
+                 file_type, content, json.dumps(tags), date,
+                 json.dumps(metadata) if metadata else None, doc_number),
+            )
+            if file_type in ("md", "txt"):
+                await store_chunks_sqlite(db, doc_id, chunk_text(content or ""))
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            await db.rollback()
+            raise DuplicateDocumentError(dir_path, filename)
+        except Exception:
+            await db.rollback()
+            raise
         return {"id": doc_id, "filename": filename, "path": dir_path}
 
     async def update_document(self, doc_id: str, content: str, tags: list[str] | None = None, title: str | None = None, date: str | None = None, metadata: dict | None = None) -> dict | None:
         db = self._db_or_raise()
-        sets = ["content = ?", "version = version + 1", "updated_at = datetime('now')"]
+        sets = ["content = ?", "version = COALESCE(version, 0) + 1", "updated_at = datetime('now')"]
         args: list = [content]
 
         if title is not None:
@@ -162,11 +172,23 @@ class SqliteVaultFS(VaultFS):
             args.append(json.dumps(metadata))
 
         args.append(doc_id)
-        await db.execute(
-            f"UPDATE documents SET {', '.join(sets)} WHERE id = ?",
-            tuple(args),
-        )
-        await db.commit()
+        try:
+            await db.execute(
+                f"UPDATE documents SET {', '.join(sets)} WHERE id = ?",
+                tuple(args),
+            )
+
+            cursor = await db.execute(
+                "SELECT file_type FROM documents WHERE id = ?", (doc_id,),
+            )
+            row = await cursor.fetchone()
+            if row and row[0] in ("md", "txt"):
+                await store_chunks_sqlite(db, doc_id, chunk_text(content or ""))
+
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
         return None
 
     async def archive_documents(self, doc_ids: list[str]) -> int:

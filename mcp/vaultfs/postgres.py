@@ -3,10 +3,12 @@
 import logging
 
 import aioboto3
+import asyncpg
 
 from config import settings
-from db import scoped_query, scoped_queryrow, scoped_execute, service_queryrow, service_execute
-from .base import VaultFS
+from db import scoped_query, scoped_queryrow, scoped_execute, service_queryrow, service_execute, get_pool
+from services.chunker import chunk_text, store_chunks_pg
+from .base import VaultFS, DuplicateDocumentError
 
 logger = logging.getLogger(__name__)
 
@@ -66,20 +68,34 @@ class PostgresVaultFS(VaultFS):
 
     async def create_document(self, kb_id: str, filename: str, title: str, dir_path: str, file_type: str, content: str, tags: list[str], date: str | None = None, metadata: dict | None = None) -> dict:
         import json as _json
-        return await service_queryrow(
-            "INSERT INTO documents (knowledge_base_id, user_id, filename, title, path, "
-            "file_type, status, content, tags, date, metadata, version) "
-            "VALUES ($1, $2, $3, $4, $5, $6, 'ready', $7, $8, $9, $10::jsonb, 0) RETURNING id, filename, path",
-            kb_id, self.user_id, filename, title, dir_path, file_type, content, tags,
-            date, _json.dumps(metadata) if metadata else None,
-        )
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    row = await conn.fetchrow(
+                        "INSERT INTO documents (knowledge_base_id, user_id, filename, title, path, "
+                        "file_type, status, content, tags, date, metadata, version) "
+                        "VALUES ($1, $2, $3, $4, $5, $6, 'ready', $7, $8, $9, $10::jsonb, 1) "
+                        "RETURNING id, filename, path",
+                        kb_id, self.user_id, filename, title, dir_path, file_type, content, tags,
+                        date, _json.dumps(metadata) if metadata else None,
+                    )
+                except asyncpg.UniqueViolationError as e:
+                    # Only re-raise as DuplicateDocumentError for the path/filename index.
+                    # Any other unique violation is a different bug worth surfacing.
+                    if getattr(e, "constraint_name", "") == "idx_documents_unique_active":
+                        raise DuplicateDocumentError(dir_path, filename)
+                    raise
+                if file_type in ("md", "txt"):
+                    chunks = chunk_text(content or "")
+                    await store_chunks_pg(conn, str(row["id"]), self.user_id, kb_id, chunks)
+        return dict(row)
 
     async def update_document(self, doc_id: str, content: str, tags: list[str] | None = None, title: str | None = None, date: str | None = None, metadata: dict | None = None) -> dict | None:
         import json as _json
-        # Build SET clauses dynamically based on what's provided
-        sets = ["content = $1", "version = version + 1", "updated_at = now()"]
+        sets = ["content = $1", "version = COALESCE(version, 0) + 1", "updated_at = now()"]
         args: list = [content, doc_id, self.user_id]
-        idx = 4  # next param index
+        idx = 4
 
         if title is not None:
             sets.append(f"title = ${idx}")
@@ -98,12 +114,23 @@ class PostgresVaultFS(VaultFS):
             args.append(_json.dumps(metadata))
             idx += 1
 
-        sql = f"UPDATE documents SET {', '.join(sets)} WHERE id = $2 AND user_id = $3"
-        if title is not None:
-            sql += " RETURNING id, filename, path"
-            return await service_queryrow(sql, *args)
-        await service_execute(sql, *args)
-        return None
+        sql = (
+            f"UPDATE documents SET {', '.join(sets)} "
+            f"WHERE id = $2 AND user_id = $3 "
+            f"RETURNING id, filename, path, knowledge_base_id, file_type"
+        )
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(sql, *args)
+                if row and row["file_type"] in ("md", "txt"):
+                    chunks = chunk_text(content or "")
+                    await store_chunks_pg(
+                        conn, str(row["id"]), self.user_id,
+                        str(row["knowledge_base_id"]), chunks,
+                    )
+        return {"id": row["id"], "filename": row["filename"], "path": row["path"]} if row and title is not None else None
 
     async def archive_documents(self, doc_ids: list[str]) -> int:
         result = await service_execute(

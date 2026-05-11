@@ -57,7 +57,13 @@ class SearchHandler:
         sources = [d for d in docs if not d["path"].startswith("/wiki/")]
         wiki_pages = [d for d in docs if d["path"].startswith("/wiki/")]
 
-        lines = [f"**{self.kb['name']}** (`{target}`):\n"]
+        scope_parts = []
+        if target not in ("*", "**", "**/*"):
+            scope_parts.append(f"`{target}`")
+        if tags:
+            scope_parts.append(f"tags: {', '.join(tags)}")
+        scope = f" ({' — '.join(scope_parts)})" if scope_parts else ""
+        lines = [f"**{self.kb['name']}**{scope}:\n"]
 
         if sources:
             lines.append(f"**Sources ({len(sources)}):**")

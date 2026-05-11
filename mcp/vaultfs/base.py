@@ -1,6 +1,15 @@
 from abc import ABC, abstractmethod
 
 
+class DuplicateDocumentError(Exception):
+    """Raised when create_document hits a uniqueness constraint on (kb, path, filename)."""
+
+    def __init__(self, dir_path: str, filename: str):
+        self.dir_path = dir_path
+        self.filename = filename
+        super().__init__(f"document already exists at {dir_path}{filename}")
+
+
 class VaultFS(ABC):
     """Abstract virtual filesystem for the knowledge vault."""
 

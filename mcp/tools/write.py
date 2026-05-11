@@ -7,6 +7,7 @@ from datetime import date
 from mcp.server.fastmcp import FastMCP, Context
 
 from vaultfs import VaultFS
+from vaultfs.base import DuplicateDocumentError
 from .helpers import deep_link, resolve_path
 from .references import update_references
 
@@ -84,7 +85,13 @@ class WriteHandler:
             await self.fs.update_document(str(existing["id"]), content, tags, title=title, date=fm_date, metadata=fm_metadata)
             doc = existing
         else:
-            doc = await self.fs.create_document(self.kb_id, filename, title, dir_path, file_type, content, tags, date=fm_date, metadata=fm_metadata)
+            try:
+                doc = await self.fs.create_document(self.kb_id, filename, title, dir_path, file_type, content, tags, date=fm_date, metadata=fm_metadata)
+            except DuplicateDocumentError:
+                return (
+                    f"Error: `{dir_path}{filename}` already exists. "
+                    f"Use the `edit` tool to modify it, or pass `overwrite=true` to replace it entirely."
+                )
 
         doc_id = str(doc["id"])
         await self._sync_references(doc_id, content, dir_path, file_type)
