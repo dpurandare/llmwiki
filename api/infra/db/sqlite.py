@@ -50,7 +50,7 @@ async def create_pool(db_path: str) -> aiosqlite.Connection:
     db.row_factory = None
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA foreign_keys=ON")
-    schema = _SCHEMA_PATH.read_text()
+    schema = _SCHEMA_PATH.read_text(encoding='utf-8')
     await db.executescript(schema)
     await db.commit()
     return db

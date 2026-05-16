@@ -61,7 +61,7 @@ class SqliteVaultFS(VaultFS):
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA foreign_keys=ON")
         if _SCHEMA_PATH.exists():
-            await _db.executescript(_SCHEMA_PATH.read_text())
+            await _db.executescript(_SCHEMA_PATH.read_text(encoding='utf-8'))
             await _db.commit()
         logger.info("SQLite initialized: %s", db_path)
 
