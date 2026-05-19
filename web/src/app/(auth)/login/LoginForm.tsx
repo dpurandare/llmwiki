@@ -36,7 +36,13 @@ function LoginFormInner() {
         return
       }
 
-      const dest = returnTo && returnTo.startsWith('/') && !returnTo.startsWith('//') ? returnTo : '/wikis'
+      let dest = '/wikis'
+      if (returnTo && !returnTo.includes('\\')) {
+        try {
+          const url = new URL(returnTo, window.location.origin)
+          if (url.origin === window.location.origin) dest = `${url.pathname}${url.search}${url.hash}`
+        } catch { /* invalid URL, fall through to /wikis */ }
+      }
       router.push(dest)
     } catch (err) {
       setError(getAuthErrorMessage(err))

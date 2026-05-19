@@ -36,20 +36,26 @@ export function AuthProvider({ userId, email, children }: AuthProviderProps) {
       return
     }
 
+    let cancelled = false
     let subscription: { unsubscribe: () => void } | undefined
 
     import('@/lib/supabase/client').then(({ createClient }) => {
+      if (cancelled) return
       const supabase = createClient()
       supabase.auth.getUser().then(async ({ data: { user: authUser } }) => {
+        if (cancelled) return
         if (!authUser) {
           signOut()
           useKBStore.setState({ knowledgeBases: [], loading: false, error: null })
+          router.replace('/login')
           return
         }
         const { data: { session } } = await supabase.auth.getSession()
+        if (cancelled) return
         if (!session) {
           signOut()
           useKBStore.setState({ knowledgeBases: [], loading: false, error: null })
+          router.replace('/login')
           return
         }
         setUser({ id: userId, email })
@@ -58,6 +64,7 @@ export function AuthProvider({ userId, email, children }: AuthProviderProps) {
 
         try {
           const me = await apiFetch<{ onboarded: boolean }>('/v1/me', session.access_token)
+          if (cancelled) return
           setOnboarded(me.onboarded)
           if (!me.onboarded && pathname !== '/onboarding') {
             router.replace('/onboarding')
@@ -69,6 +76,7 @@ export function AuthProvider({ userId, email, children }: AuthProviderProps) {
       })
 
       const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+        if (cancelled) return
         if (session) {
           useUserStore.getState().setAccessToken(session.access_token)
         } else {
@@ -80,7 +88,10 @@ export function AuthProvider({ userId, email, children }: AuthProviderProps) {
       subscription = data.subscription
     })
 
-    return () => subscription?.unsubscribe()
+    return () => {
+      cancelled = true
+      subscription?.unsubscribe()
+    }
   }, [userId, email, setUser, setAccessToken, setOnboarded, fetchKBs, router, pathname, signOut])
 
   React.useEffect(() => {

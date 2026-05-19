@@ -241,6 +241,26 @@ class TestPublicReadIsolation:
         assert resp.status_code == 200
         assert resp.headers.get("cache-control") == "no-store, must-revalidate"
 
+    async def test_public_read_excludes_other_public_kbs(self, client, pool):
+        """Both Alice and Bob have public wikis. Alice's read must NOT return
+        Bob's docs. Catches a regression where the docs JOIN drops the
+        kb.public_slug predicate.
+        """
+        await publish_kb(pool, KB_A_ID, "alice-public")
+        await publish_kb(pool, KB_B_ID, "bob-public")
+
+        resp = await client.get("/v1/public/wiki/alice-public")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["kb"]["public_slug"] == "alice-public"
+        assert body["kb"]["author_name"] == "Alice"
+        # Every doc returned must be Alice's. Bob's notes.md happens to have
+        # the same path/filename, so we assert by content instead.
+        for d in body["documents"]:
+            assert "Bob" not in (d.get("content") or ""), (
+                f"Bob's content leaked into Alice's public wiki: {d}"
+            )
+
 
 # ─────────── GET /public/wiki/{slug}/assets — surface boundary ───────────
 
@@ -277,11 +297,14 @@ class TestPublicAssetIsolation:
         # Bob's KB is still private.
 
         resp = await client.get("/v1/public/wiki/alice-cross-kb/assets/9")
-        # Should resolve to Alice's doc 9, never Bob's.
-        assert resp.status_code in (200, 404)
+        # No matter what status, Bob's S3 key must NEVER be requested.
+        assert all(USER_B_ID not in k and DOC_B_ID not in k for k in fake_s3.calls), (
+            f"Bob's S3 key leaked into a public Alice request: {fake_s3.calls}"
+        )
+        # Resolution path should land on Alice's doc 9 (200 with Alice key) or
+        # 404 from S3 if the test object isn't stored.
         if resp.status_code == 200:
             assert all(USER_A_ID in k and DOC_A_ID in k for k in fake_s3.calls)
-            assert not any(DOC_B_ID in k for k in fake_s3.calls)
 
     async def test_asset_revoked_kb_404s(self, client, pool, fake_s3):
         await set_document_number(pool, DOC_A_ID, 11)
@@ -298,34 +321,34 @@ class TestPublicAssetIsolation:
 
 class TestRevocationTOCTOU:
 
-    async def test_visibility_flip_between_queries_blocks_content(self, client, pool):
-        """Flip visibility AFTER the KB row is fetched but BEFORE the docs query.
+    async def test_revoke_between_request_arrival_and_query_blocks_response(self, client, pool):
+        """Flip visibility BEFORE the single-statement query runs.
 
-        The implementation re-applies `visibility = 'public'` in the docs JOIN,
-        so the second query returns zero rows even when the KB lookup saw it
-        as still public. This is the deterministic TOCTOU defense — we use a
-        proxy that runs the flip between calls instead of racing in CI.
+        The implementation reads KB metadata, author, and docs in one
+        statement gated on `visibility = 'public'`. A flip immediately
+        before the query sees the private state and returns no rows;
+        the service returns None and the route 404s. No KB metadata,
+        no author, no docs leak.
         """
         await publish_kb(pool, KB_A_ID, "toctou-test")
 
-        class _RacingPoolProxy:
+        class _RevokingPoolProxy:
             def __init__(self, real_pool, kb_id):
                 self._pool = real_pool
                 self._kb_id = kb_id
-                self._kb_lookup_done = False
+                self._revoked = False
 
-            async def fetchrow(self, query, *args, **kwargs):
-                row = await self._pool.fetchrow(query, *args, **kwargs)
-                if not self._kb_lookup_done and "knowledge_bases" in query and "documents" not in query:
-                    self._kb_lookup_done = True
+            async def fetch(self, query, *args, **kwargs):
+                if not self._revoked and "knowledge_bases" in query:
+                    self._revoked = True
                     await self._pool.execute(
                         "UPDATE knowledge_bases SET visibility = 'private' WHERE id = $1",
                         self._kb_id,
                     )
-                return row
-
-            async def fetch(self, query, *args, **kwargs):
                 return await self._pool.fetch(query, *args, **kwargs)
+
+            async def fetchrow(self, query, *args, **kwargs):
+                return await self._pool.fetchrow(query, *args, **kwargs)
 
             async def execute(self, query, *args, **kwargs):
                 return await self._pool.execute(query, *args, **kwargs)
@@ -334,12 +357,12 @@ class TestRevocationTOCTOU:
                 return await self._pool.fetchval(query, *args, **kwargs)
 
         from services.hosted import HostedPublicWikiService
-        svc = HostedPublicWikiService(_RacingPoolProxy(pool, KB_A_ID), s3=None)
+        svc = HostedPublicWikiService(_RevokingPoolProxy(pool, KB_A_ID), s3=None)
 
         result = await svc.get_by_slug("toctou-test")
-        assert result is not None, "regression: docs join returned None instead of an empty list"
-        assert result["documents"] == [], (
-            "TOCTOU leak: docs query did not re-apply visibility filter"
+        assert result is None, (
+            "TOCTOU leak: revoked KB returned content. Single-statement "
+            "visibility gate was bypassed."
         )
 
 

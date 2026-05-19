@@ -32,7 +32,6 @@ export default function LandingPage() {
   return (
     <div className="min-h-svh bg-background text-foreground">
       <AuthRedirect />
-
       <script
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}

@@ -830,48 +830,60 @@ class HostedPublicWikiService(PublicWikiService):
         self.s3 = s3
 
     async def get_by_slug(self, slug: str) -> dict | None:
-        kb = await self.pool.fetchrow(
-            "SELECT id::text, user_id::text, name, slug, description, "
-            "       public_slug, published_at, updated_at "
-            "FROM knowledge_bases "
-            "WHERE public_slug = $1 AND visibility = 'public'",
-            slug,
-        )
-        if not kb:
-            return None
-
-        # Re-applies the visibility filter via JOIN so a flip between the two
-        # queries can't leak content from a wiki that was just revoked.
-        docs = await self.pool.fetch(
-            "SELECT d.id::text, d.document_number, d.filename, d.path, d.title, "
-            "       d.content, d.file_type, d.tags, d.updated_at "
-            "FROM documents d "
-            "JOIN knowledge_bases kb ON kb.id = d.knowledge_base_id "
-            "WHERE kb.public_slug = $1 "
-            "  AND kb.visibility = 'public' "
+        # Single LEFT JOIN — visibility, KB metadata, author, and docs all
+        # come from one statement. A flip mid-statement is impossible
+        # (Postgres reads a consistent snapshot), so there's no TOCTOU
+        # window between "is it public" and "what's the content".
+        rows = await self.pool.fetch(
+            "SELECT kb.id::text AS kb_id, kb.user_id::text AS kb_user_id, "
+            "       kb.name AS kb_name, kb.description AS kb_description, "
+            "       kb.public_slug AS kb_public_slug, "
+            "       kb.published_at AS kb_published_at, "
+            "       kb.updated_at AS kb_updated_at, "
+            "       u.display_name AS author_name, "
+            "       d.id::text AS doc_id, d.document_number, d.filename, "
+            "       d.path, d.title, d.content, d.file_type, d.tags, "
+            "       d.updated_at AS doc_updated_at "
+            "FROM knowledge_bases kb "
+            "LEFT JOIN users u ON u.id = kb.user_id "
+            "LEFT JOIN documents d ON d.knowledge_base_id = kb.id "
             "  AND d.path LIKE '/wiki/%' "
             "  AND d.status = 'ready' "
             "  AND NOT d.archived "
+            "WHERE kb.public_slug = $1 AND kb.visibility = 'public' "
             "ORDER BY d.path, COALESCE(d.sort_order, 0), d.filename",
             slug,
         )
+        if not rows:
+            return None
 
-        author = await self.pool.fetchrow(
-            "SELECT display_name FROM users WHERE id = $1",
-            kb["user_id"],
-        )
+        head = rows[0]
+        documents = [
+            {
+                "id": r["doc_id"],
+                "document_number": r["document_number"],
+                "filename": r["filename"],
+                "path": r["path"],
+                "title": r["title"],
+                "content": r["content"],
+                "file_type": r["file_type"],
+                "tags": r["tags"],
+                "updated_at": r["doc_updated_at"],
+            }
+            for r in rows if r["doc_id"] is not None
+        ]
 
         return {
             "kb": {
-                "id": kb["id"],
-                "name": kb["name"],
-                "description": kb["description"],
-                "public_slug": kb["public_slug"],
-                "published_at": kb["published_at"].isoformat() if kb["published_at"] else None,
-                "updated_at": kb["updated_at"].isoformat() if kb["updated_at"] else None,
-                "author_name": author["display_name"] if author and author["display_name"] else None,
+                "id": head["kb_id"],
+                "name": head["kb_name"],
+                "description": head["kb_description"],
+                "public_slug": head["kb_public_slug"],
+                "published_at": head["kb_published_at"].isoformat() if head["kb_published_at"] else None,
+                "updated_at": head["kb_updated_at"].isoformat() if head["kb_updated_at"] else None,
+                "author_name": head["author_name"] or None,
             },
-            "documents": [dict(d) for d in docs],
+            "documents": documents,
         }
 
     async def get_asset_key(self, slug: str, document_number: int) -> str | None:
